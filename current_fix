@@ -1,0 +1,357 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+# Current Data File Integral Correction Tool
+# Author: ZhiCheng Zhang <zhangzhicheng@cnncmail.cn>
+# Date: 2025-07-30
+
+import csv
+import os
+import sys
+import time
+from decimal import Decimal, getcontext
+from PyQt5.QtWidgets import (QApplication, QMainWindow, QVBoxLayout, QWidget, 
+                             QLabel, QPushButton, QHBoxLayout, QFileDialog,
+                             QMessageBox, QTextEdit, QProgressBar)
+from PyQt5.QtCore import QThread, pyqtSignal
+from PyQt5.QtGui import QFont
+
+# 设置高精度计算
+getcontext().prec = 28
+
+class DataProcessor(QThread):
+    """数据处理线程"""
+    progress_updated = pyqtSignal(int)
+    status_updated = pyqtSignal(str)
+    finished_signal = pyqtSignal(bool, str)
+    
+    def __init__(self, input_file, output_file):
+        super().__init__()
+        self.input_file = input_file
+        self.output_file = output_file
+    
+    def run(self):
+        try:
+            self.process_file()
+        except Exception as e:
+            self.finished_signal.emit(False, str(e))
+    
+    def process_file(self):
+        """处理文件的主要逻辑"""
+        self.status_updated.emit("Reading input file...")
+        
+        # 读取原始数据
+        data_rows = []
+        comment_lines = []
+        
+        with open(self.input_file, 'r', encoding='utf-8') as f:
+            reader = csv.reader(f)
+            total_lines = sum(1 for _ in open(self.input_file, 'r', encoding='utf-8'))
+            f.seek(0)  # 重置文件指针
+            
+            line_count = 0
+            for row in reader:
+                line_count += 1
+                progress = int((line_count / total_lines) * 50)  # 前50%用于读取
+                self.progress_updated.emit(progress)
+                
+                if not row:  # 空行
+                    continue
+                
+                # 检查是否为注释行
+                if row[0].strip().startswith('#'):
+                    comment_lines.append(','.join(row))
+                    continue
+                
+                # 检查是否为表头
+                if 'UTC Timestamp' in row[0] or 'Run Time' in row[0]:
+                    continue
+                
+                # 尝试解析数据行
+                try:
+                    if len(row) >= 6:
+                        utc_timestamp = float(row[0])
+                        runtime = float(row[1])
+                        current1 = float(row[2])
+                        current2 = float(row[3])
+                        # 忽略原始的积分值 row[4] 和 row[5]
+                        
+                        data_rows.append({
+                            'utc_timestamp': utc_timestamp,
+                            'runtime': runtime,
+                            'current1': current1,
+                            'current2': current2
+                        })
+                except (ValueError, IndexError):
+                    # 跳过无法解析的行
+                    continue
+        
+        if not data_rows:
+            self.finished_signal.emit(False, "No valid data rows found in the input file")
+            return
+        
+        self.status_updated.emit(f"Found {len(data_rows)} data points. Recalculating integrals...")
+        
+        # 重新计算积分
+        integral1 = Decimal('0.0')
+        integral2 = Decimal('0.0')
+        
+        # 为每个数据点重新计算积分
+        for i, row in enumerate(data_rows):
+            progress = 50 + int((i / len(data_rows)) * 50)  # 后50%用于计算
+            self.progress_updated.emit(progress)
+            
+            if i > 0:
+                # 计算时间间隔
+                prev_row = data_rows[i-1]
+                delta_t = row['runtime'] - prev_row['runtime']
+                
+                if delta_t > 0:  # 确保时间间隔有效
+                    # 使用梯形法则计算积分增量
+                    avg_current1 = Decimal(str((prev_row['current1'] + row['current1']) / 2.0))
+                    avg_current2 = Decimal(str((prev_row['current2'] + row['current2']) / 2.0))
+                    
+                    charge_increment1 = avg_current1 * Decimal(str(delta_t))
+                    charge_increment2 = avg_current2 * Decimal(str(delta_t))
+                    
+                    integral1 += charge_increment1
+                    integral2 += charge_increment2
+            
+            # 将计算结果存储回数据行
+            row['integral1'] = float(integral1)
+            row['integral2'] = float(integral2)
+        
+        self.status_updated.emit("Writing corrected data to output file...")
+        
+        # 写入修正后的文件
+        with open(self.output_file, 'w', newline='', encoding='utf-8') as f:
+            writer = csv.writer(f)
+            
+            # 写入表头
+            writer.writerow(['UTC Timestamp', 'Run Time (Seconds)', 'Channel 1 Current (mA)', 
+                           'Channel 2 Current (mA)', 'Channel 1 Integral (mC)', 'Channel 2 Integral (mC)'])
+            
+            # 写入注释（如果有的话）
+            for comment in comment_lines:
+                f.write(comment + '\n')
+            
+            # 添加修正说明
+            timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
+            f.write(f"# Integral values corrected on {timestamp} using high-precision calculation\n")
+            
+            # 写入数据
+            for row in data_rows:
+                writer.writerow([
+                    f"{row['utc_timestamp']:.1f}",
+                    f"{row['runtime']:.3f}",
+                    f"{row['current1']:.3f}",
+                    f"{row['current2']:.3f}",
+                    f"{row['integral1']:.3f}",
+                    f"{row['integral2']:.3f}"
+                ])
+        
+        self.status_updated.emit("Correction completed successfully!")
+        self.finished_signal.emit(True, f"File corrected successfully!\nOutput: {self.output_file}")
+
+class IntegralCorrectionTool(QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.init_ui()
+        
+    def init_ui(self):
+        self.setWindowTitle("Current Data Integral Correction Tool")
+        self.setGeometry(200, 200, 600, 500)
+        
+        # 主布局
+        main_widget = QWidget()
+        self.setCentralWidget(main_widget)
+        layout = QVBoxLayout(main_widget)
+        
+        # 标题
+        title_label = QLabel("Current Data Integral Correction Tool")
+        title_font = QFont()
+        title_font.setPointSize(16)
+        title_font.setBold(True)
+        title_label.setFont(title_font)
+        title_label.setStyleSheet("color: #2E86AB; margin: 10px;")
+        layout.addWidget(title_label)
+        
+        # 说明文本
+        info_text = QLabel("""
+This tool fixes the integral calculation precision issue in current monitoring data files.
+It recalculates the charge integrals using high-precision arithmetic (28 significant digits).
+
+Instructions:
+1. Select the input file (original current data file)
+2. Choose where to save the corrected file
+3. Click 'Start Correction' to process the data
+        """)
+        info_text.setWordWrap(True)
+        info_text.setStyleSheet("background-color: #f0f8ff; padding: 10px; border: 1px solid #ddd; border-radius: 5px;")
+        layout.addWidget(info_text)
+        
+        # 文件选择区域
+        file_layout = QVBoxLayout()
+        
+        # 输入文件选择
+        input_layout = QHBoxLayout()
+        self.input_label = QLabel("Input File: Not selected")
+        self.input_button = QPushButton("Select Input File")
+        self.input_button.clicked.connect(self.select_input_file)
+        self.input_button.setStyleSheet("background-color: #4CAF50; color: white; font-weight: bold; padding: 8px;")
+        
+        input_layout.addWidget(self.input_label)
+        input_layout.addWidget(self.input_button)
+        
+        # 输出文件选择
+        output_layout = QHBoxLayout()
+        self.output_label = QLabel("Output File: Not selected")
+        self.output_button = QPushButton("Select Output File")
+        self.output_button.clicked.connect(self.select_output_file)
+        self.output_button.setStyleSheet("background-color: #2196F3; color: white; font-weight: bold; padding: 8px;")
+        
+        output_layout.addWidget(self.output_label)
+        output_layout.addWidget(self.output_button)
+        
+        file_layout.addLayout(input_layout)
+        file_layout.addLayout(output_layout)
+        layout.addLayout(file_layout)
+        
+        # 处理按钮
+        self.process_button = QPushButton("Start Correction")
+        self.process_button.clicked.connect(self.start_processing)
+        self.process_button.setEnabled(False)
+        self.process_button.setStyleSheet("background-color: #FF9800; color: white; font-weight: bold; padding: 12px; font-size: 14px;")
+        layout.addWidget(self.process_button)
+        
+        # 进度条
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setVisible(False)
+        layout.addWidget(self.progress_bar)
+        
+        # 状态显示
+        self.status_label = QLabel("Ready to process files")
+        self.status_label.setStyleSheet("color: #666; font-style: italic; margin: 5px;")
+        layout.addWidget(self.status_label)
+        
+        # 日志显示
+        self.log_text = QTextEdit()
+        self.log_text.setMaximumHeight(150)
+        self.log_text.setReadOnly(True)
+        self.log_text.setStyleSheet("background-color: #f9f9f9; font-family: monospace; font-size: 10px;")
+        layout.addWidget(self.log_text)
+        
+        # 初始化变量
+        self.input_file = ""
+        self.output_file = ""
+        
+    def select_input_file(self):
+        """选择输入文件"""
+        file_path, _ = QFileDialog.getOpenFileName(
+            self, "Select Input Current Data File", "", "CSV Files (*.csv);;All Files (*)"
+        )
+        
+        if file_path:
+            self.input_file = file_path
+            self.input_label.setText(f"Input File: {os.path.basename(file_path)}")
+            self.input_label.setToolTip(file_path)
+            
+            # 自动生成输出文件名
+            if not self.output_file:
+                base_name, ext = os.path.splitext(file_path)
+                suggested_output = f"{base_name}_corrected{ext}"
+                self.output_file = suggested_output
+                self.output_label.setText(f"Output File: {os.path.basename(suggested_output)}")
+                self.output_label.setToolTip(suggested_output)
+            
+            self.check_ready_to_process()
+            self.log_text.append(f"Selected input file: {file_path}")
+    
+    def select_output_file(self):
+        """选择输出文件"""
+        file_path, _ = QFileDialog.getSaveFileName(
+            self, "Select Output File Location", self.output_file, "CSV Files (*.csv);;All Files (*)"
+        )
+        
+        if file_path:
+            if not file_path.lower().endswith('.csv'):
+                file_path += '.csv'
+            self.output_file = file_path
+            self.output_label.setText(f"Output File: {os.path.basename(file_path)}")
+            self.output_label.setToolTip(file_path)
+            self.check_ready_to_process()
+            self.log_text.append(f"Selected output file: {file_path}")
+    
+    def check_ready_to_process(self):
+        """检查是否准备好处理"""
+        if self.input_file and self.output_file:
+            self.process_button.setEnabled(True)
+            self.status_label.setText("Ready to start correction")
+            self.status_label.setStyleSheet("color: green; font-style: italic; margin: 5px;")
+        else:
+            self.process_button.setEnabled(False)
+    
+    def start_processing(self):
+        """开始处理"""
+        if not os.path.exists(self.input_file):
+            QMessageBox.critical(self, "Error", "Input file does not exist!")
+            return
+        
+        # 检查输出文件是否会覆盖输入文件
+        if os.path.abspath(self.input_file) == os.path.abspath(self.output_file):
+            QMessageBox.critical(self, "Error", "Output file cannot be the same as input file!")
+            return
+        
+        # 如果输出文件存在，询问是否覆盖
+        if os.path.exists(self.output_file):
+            reply = QMessageBox.question(self, "Confirm Overwrite", 
+                                       f"Output file already exists. Overwrite?\n{self.output_file}",
+                                       QMessageBox.Yes | QMessageBox.No)
+            if reply == QMessageBox.No:
+                return
+        
+        # 禁用按钮并显示进度条
+        self.process_button.setEnabled(False)
+        self.progress_bar.setVisible(True)
+        self.progress_bar.setValue(0)
+        
+        # 创建并启动处理线程
+        self.processor = DataProcessor(self.input_file, self.output_file)
+        self.processor.progress_updated.connect(self.progress_bar.setValue)
+        self.processor.status_updated.connect(self.update_status)
+        self.processor.finished_signal.connect(self.processing_finished)
+        self.processor.start()
+        
+        self.log_text.append("Started processing...")
+    
+    def update_status(self, message):
+        """更新状态"""
+        self.status_label.setText(message)
+        self.log_text.append(message)
+    
+    def processing_finished(self, success, message):
+        """处理完成"""
+        self.progress_bar.setVisible(False)
+        self.process_button.setEnabled(True)
+        
+        if success:
+            self.status_label.setText("Correction completed successfully!")
+            self.status_label.setStyleSheet("color: green; font-weight: bold; margin: 5px;")
+            QMessageBox.information(self, "Success", message)
+            self.log_text.append("✓ Correction completed successfully!")
+        else:
+            self.status_label.setText(f"Error: {message}")
+            self.status_label.setStyleSheet("color: red; font-weight: bold; margin: 5px;")
+            QMessageBox.critical(self, "Error", f"Processing failed:\n{message}")
+            self.log_text.append(f"✗ Error: {message}")
+
+def main():
+    app = QApplication(sys.argv)
+    app.setApplicationName("Integral Correction Tool")
+    
+    window = IntegralCorrectionTool()
+    window.show()
+    
+    sys.exit(app.exec_())
+
+if __name__ == "__main__":
+    main()
